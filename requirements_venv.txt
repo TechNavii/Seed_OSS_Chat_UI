@@ -1,0 +1,8 @@
+torch
+torchvision
+torchaudio
+gradio
+accelerate
+huggingface-hub
+# Note: transformers is installed from custom fork
+# git+https://github.com/Fazziekey/transformers.git@seed-oss
