@@ -20,7 +20,8 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TextIteratorStreamer,
-    GenerationConfig as HFGenerationConfig
+    StoppingCriteria,
+    StoppingCriteriaList,
 )
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -37,12 +38,13 @@ class DeviceType(Enum):
 @dataclass
 class GenerationConfig:
     """Configuration for text generation parameters."""
-    max_tokens: int = 1024
-    temperature: float = 0.7
-    top_p: float = 0.9
-    thinking_budget: int = 1024  # Keep at 1024 per user requirement
+    max_tokens: int = 9000  # Higher default to leave room after thinking
+    temperature: float = 1.0  # Use 1.0 for better numerical stability
+    top_p: float = 0.95  # Slightly higher for stability
+    thinking_budget: int = 1024  # Used to cap thinking; clamped to leave answer room
     use_sampling: bool = True
-    repetition_penalty: float = 1.1
+    repetition_penalty: float = 1.02  # Gentle penalty; <=1.05 per tests
+    min_response_tokens: int = 800  # Minimum tokens reserved for response
 
 
 class DeviceManager:
@@ -146,14 +148,22 @@ class ResponseParser:
         response = ""
         if self.SEED_TAGS['think_end'] in text:
             response_start = text.find(self.SEED_TAGS['think_end']) + len(self.SEED_TAGS['think_end'])
-            response = text[response_start:].strip()
+            response_text = text[response_start:].strip()
+            
+            # Debug: Check what comes after thinking
+            if not response_text and response_start < len(text):
+                print(f"[Debug] After think_end, found: {repr(text[response_start:response_start+100])}")
+            
+            response = response_text
         elif self.SEED_TAGS['think_start'] not in text:
             # No thinking phase, entire text is response
             response = text.strip()
         
-        # Clean up response from special tokens
-        for tag in self.SEED_TAGS.values():
-            response = response.replace(tag, '')
+        # Clean up response from special tokens (but preserve actual content)
+        # Only remove seed tags, not the actual response
+        for tag_name, tag_value in self.SEED_TAGS.items():
+            if tag_name != 'think_end':  # Don't remove content after think_end
+                response = response.replace(tag_value, '')
         
         response = response.strip()
         
@@ -306,7 +316,7 @@ class ImprovedChatStreamer:
     def __init__(self, model_manager: ModelManager, parser: ResponseParser):
         self.model_manager = model_manager
         self.parser = parser
-        self.generation_timeout = 120  # 2 minutes timeout
+        self.generation_timeout = 1800  # 30 minutes timeout for long tasks
     
     def generate_response(
         self,
@@ -323,7 +333,7 @@ class ImprovedChatStreamer:
             # Build messages
             messages = self._build_messages(history, message)
             
-            # Tokenize with thinking budget
+            # Tokenize with bounded thinking budget (ensures room for answer)
             input_ids = self._tokenize_with_thinking(messages, generation_config)
             
             # Create streamer
@@ -334,13 +344,21 @@ class ImprovedChatStreamer:
                 skip_special_tokens=False
             )
             
-            # Start generation
+            # Start generation with an interrupt event so we can stop cleanly
+            stop_event = threading.Event()
             generation_thread = self._start_generation_thread(
-                input_ids, streamer, generation_config
+                input_ids, streamer, generation_config, stop_event
             )
             
             # Stream response with improved handling
-            yield from self._stream_response_improved(streamer, generation_thread)
+            yield from self._stream_response_improved(
+                streamer,
+                generation_thread,
+                stop_event,
+                message,
+                history,
+                generation_config,
+            )
             
         except Exception as e:
             print(f"❌ Generation error: {e}")
@@ -364,27 +382,50 @@ class ImprovedChatStreamer:
         messages: list, 
         config: GenerationConfig
     ) -> torch.Tensor:
-        """Tokenize with thinking budget support."""
+        """Tokenize with a SAFE thinking budget to avoid indefinite thinking.
+
+        We clamp the thinking_budget so that it never exceeds
+        (max_tokens - min_response_tokens), ensuring there is always
+        room for the actual answer.
+        """
+        max_for_thinking = max(0, config.max_tokens - max(0, config.min_response_tokens))
+        safe_thinking_budget = max(0, min(config.thinking_budget, max_for_thinking))
+        print(
+            f"[Debug] Tokenizing with thinking_budget={safe_thinking_budget} (max_for_thinking={max_for_thinking})"
+        )
+        
         try:
-            # Try with thinking_budget (custom fork feature)
-            print(f"[Debug] Tokenizing with thinking_budget={config.thinking_budget}")
-            input_ids = self.model_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                thinking_budget=config.thinking_budget
-            )
-            print("[Debug] Successfully tokenized with thinking budget")
-        except (TypeError, AttributeError) as e:
-            # Fallback to standard tokenization
-            print(f"[Debug] Thinking budget not supported, using standard tokenization")
-            input_ids = self.model_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_tensors="pt"
-            )
+            if safe_thinking_budget == 0:
+                # No-think mode: avoid injecting any think tags via template
+                input_ids = self.model_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                )
+            else:
+                try:
+                    # Prefer passing thinking_budget if supported by the custom fork
+                    input_ids = self.model_manager.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        return_tensors="pt",
+                        thinking_budget=safe_thinking_budget,
+                    )
+                except TypeError:
+                    # Fallback for environments without thinking_budget support
+                    print("[Debug] Tokenizer.apply_chat_template doesn't accept thinking_budget; falling back without it")
+                    input_ids = self.model_manager.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        return_tensors="pt",
+                    )
+            print("[Debug] Successfully tokenized")
+        except Exception as e:
+            print(f"[Debug] Tokenization error: {e}")
+            raise
         
         return input_ids
     
@@ -392,7 +433,8 @@ class ImprovedChatStreamer:
         self,
         input_ids: torch.Tensor,
         streamer: TextIteratorStreamer,
-        config: GenerationConfig
+        config: GenerationConfig,
+        stop_event: threading.Event,
     ) -> threading.Thread:
         """Start generation in a separate thread."""
         # Get device
@@ -403,25 +445,82 @@ class ImprovedChatStreamer:
         attention_mask = torch.ones_like(input_ids)
         
         # Generation kwargs
+        # Ensure minimum tokens for both thinking AND response (guidance only)
+        # Don't set min_new_tokens too high as it can cause freezing
+        estimated_thinking = min(1000, config.thinking_budget or 1000)
+        min_tokens = min(estimated_thinking + config.min_response_tokens, 4000)  # Cap to prevent lockups
+        
+        # Ensure max_tokens is high enough but reasonable
+        actual_max_tokens = config.max_tokens
+        
+        # Ensure min_tokens doesn't exceed max_tokens
+        if min_tokens > actual_max_tokens:
+            min_tokens = min(500, actual_max_tokens // 2)  # More conservative
+        
+        # For code generation, we need different parameters
+        # Ensure numerical stability
         gen_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "max_new_tokens": config.max_tokens,
-            "temperature": config.temperature,
-            "top_p": config.top_p,
+            "max_new_tokens": actual_max_tokens,  # Use configured max
+            "min_new_tokens": None,  # Don't force minimum - let model decide when to stop
+            "temperature": max(0.1, min(2.0, config.temperature)),  # Clamp to valid range
+            "top_p": max(0.1, min(1.0, config.top_p)),  # Clamp to valid range
             "do_sample": config.use_sampling,
-            "repetition_penalty": config.repetition_penalty,
+            "repetition_penalty": max(1.0, min(2.0, config.repetition_penalty)),  # Clamp to valid range
             "pad_token_id": self.model_manager.tokenizer.pad_token_id,
             "eos_token_id": self.model_manager.tokenizer.eos_token_id,
             "streamer": streamer,
+            # Add for numerical stability
+            "top_k": 50,  # Limit vocab for stability
+            "num_beams": 1,  # Use greedy for stability
         }
+
+        # In no-think mode, discourage think/budget tokens entirely
+        if config.thinking_budget == 0:
+            banned = []
+            tok = self.model_manager.tokenizer
+            try:
+                for token_str in ("<seed:think>", "<seed:cot_budget_reflect>"):
+                    ids = tok.encode(token_str, add_special_tokens=False)
+                    if ids:
+                        banned.append(ids)
+            except Exception:
+                pass
+            if banned:
+                gen_kwargs["bad_words_ids"] = banned
         
-        print(f"[Debug] Starting generation with max_tokens={config.max_tokens}")
+        print(f"[Debug] Generation config: max={actual_max_tokens}, min=None (not forcing), thinking_est={estimated_thinking}")
+
+        # Interrupt generation cleanly when requested
+        class _EventStop(StoppingCriteria):
+            def __init__(self, event: threading.Event):
+                super().__init__()
+                self._event = event
+
+            def __call__(self, input_ids: torch.LongTensor, scores: Optional[torch.FloatTensor] = None, **kwargs) -> bool:  # type: ignore[override]
+                return self._event.is_set()
+
+        gen_kwargs["stopping_criteria"] = StoppingCriteriaList([_EventStop(stop_event)])
         
-        thread = threading.Thread(
-            target=self.model_manager.model.generate,
-            kwargs=gen_kwargs
-        )
+        # Wrap generation in try-catch for better error handling
+        def safe_generate():
+            try:
+                self.model_manager.model.generate(**gen_kwargs)
+            except RuntimeError as e:
+                if "probability tensor" in str(e):
+                    print(f"[Error] Numerical instability in generation: {e}")
+                    print("[Info] Retrying with safer parameters...")
+                    # Retry with safer parameters
+                    gen_kwargs["temperature"] = 1.0
+                    gen_kwargs["top_p"] = 0.95
+                    gen_kwargs["repetition_penalty"] = 1.0
+                    gen_kwargs["do_sample"] = False  # Use greedy decoding
+                    self.model_manager.model.generate(**gen_kwargs)
+                else:
+                    raise
+        
+        thread = threading.Thread(target=safe_generate)
         thread.start()
         return thread
     
@@ -434,11 +533,121 @@ class ImprovedChatStreamer:
             return next(self.model_manager.model.parameters()).device
         except StopIteration:
             return torch.device(self.model_manager.config.device_string)
+
+    def _force_answer_after_think(
+        self,
+        message: str,
+        history: list,
+        reasoning_text: str,
+        base_config: GenerationConfig,
+    ) -> Iterator[str]:
+        """Fallback: prefill reasoning and generate only the answer.
+
+        Strategy:
+        - Build a new message list with the conversation history and the current user message.
+        - Prefill an assistant message containing only the captured reasoning (closed with think_end).
+        - Start a fresh generation with thinking_budget=0 to encourage immediate answering.
+        - Stream only the response part to the UI.
+        """
+        try:
+            # Build messages with prefilled reasoning
+            messages = []
+            for user_msg, assistant_msg in history:
+                if user_msg:
+                    messages.append({"role": "user", "content": user_msg})
+                if assistant_msg:
+                    messages.append({"role": "assistant", "content": assistant_msg})
+            messages.append({"role": "user", "content": message})
+
+            if reasoning_text:
+                messages.append({
+                    "role": "assistant",
+                    "reasoning_content": reasoning_text,
+                    "content": "",
+                })
+
+            # Use zero thinking_budget to skip further thinking
+            try:
+                input_ids = self.model_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    thinking_budget=0,
+                )
+            except TypeError:
+                # Fallback if tokenizer doesn't accept thinking_budget kwarg
+                input_ids = self.model_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                )
+
+            # New streamer and thread
+            streamer = TextIteratorStreamer(
+                self.model_manager.tokenizer,
+                timeout=30.0,
+                skip_prompt=True,
+                skip_special_tokens=False,
+            )
+            stop_event = threading.Event()
+            thread = self._start_generation_thread(
+                input_ids, streamer, base_config, stop_event
+            )
+
+            # Stream only the response part
+            accumulated = ""
+            start_time = time.time()
+            total_tokens = 0
+            first_token_time = None
+            last_output = ""
+
+            for chunk in streamer:
+                if not chunk:
+                    continue
+                accumulated += chunk
+                if first_token_time is None:
+                    first_token_time = time.time()
+                total_tokens += max(1, len(chunk) // 4)
+
+                _, response = self.parser.extract_components(accumulated)
+                current_time = time.time() - start_time
+                speed = total_tokens / current_time if current_time > 0 else 0
+                ttft = (first_token_time - start_time) if first_token_time else 0
+
+                if response:
+                    mini = f"\n\n---\n⚡ {speed:.1f} tok/s | ⏱️ {current_time:.1f}s | 🚀 TTFT: {ttft:.3f}s | 📝 {total_tokens} tokens"
+                    output = f"💬 **Response:**\n\n{response}{mini}"
+                else:
+                    output = "⏳ Generating answer..."
+
+                if output != last_output:
+                    last_output = output
+                    yield output
+
+            thread.join(timeout=10)
+            if thread.is_alive():
+                stop_event.set()
+                thread.join(timeout=5)
+
+            # Finalize
+            _, response = self.parser.extract_components(accumulated)
+            if response and response != last_output:
+                yield f"💬 **Response:**\n\n{response}"
+
+        except Exception as e:
+            print(f"[Error] Force-answer fallback failed: {e}")
+            yield "❌ Failed to force answer generation. Try again or adjust settings."
     
     def _stream_response_improved(
         self, 
         streamer: TextIteratorStreamer,
-        thread: threading.Thread
+        thread: threading.Thread,
+        stop_event: threading.Event,
+        message: str,
+        history: list,
+        config: GenerationConfig,
     ) -> Iterator[str]:
         """Improved streaming with better thinking phase handling and telemetry."""
         accumulated = ""
@@ -447,6 +656,7 @@ class ImprovedChatStreamer:
         empty_count = 0
         thinking_phase = False
         response_started = False
+        error_occurred = False
         
         # Telemetry metrics
         start_time = time.time()
@@ -456,6 +666,9 @@ class ImprovedChatStreamer:
         total_tokens = 0
         
         try:
+            # Compute a safe cap for thinking tokens to avoid endless reasoning
+            safe_thinking_cap = max(0, min(config.thinking_budget, config.max_tokens - max(0, config.min_response_tokens)))
+            safe_thinking_cap = max(0, safe_thinking_cap)
             for chunk in streamer:
                 chunk_count += 1
                 elapsed = time.time() - start_time
@@ -463,16 +676,54 @@ class ImprovedChatStreamer:
                 # Timeout check
                 if elapsed > self.generation_timeout:
                     print(f"[Warning] Generation timeout after {elapsed:.1f}s")
+                    # Stop generation thread cleanly
+                    stop_event.set()
                     yield "⚠️ Generation timed out. Please try again."
                     break
+                
+                # Check if stuck in thinking for too long (cap by config)
+                if thinking_phase and (thinking_tokens >= safe_thinking_cap + 32):
+                    print(f"[Warning] Thinking exceeded cap: {thinking_tokens} >= {safe_thinking_cap}")
+                    # Request stop and surface a warning
+                    stop_event.set()
+                    # Wait briefly for the generator to stop before fallback
+                    for _ in range(10):  # up to ~10s
+                        if not thread.is_alive():
+                            break
+                        thread.join(timeout=1)
+                    yield "⚠️ Thinking budget reached; switching to answer mode."
+                    # Try to force answer generation in a second pass
+                    reasoning_text, _ = self.parser.extract_components(accumulated)
+                    yield from self._force_answer_after_think(
+                        message, history, reasoning_text, config
+                    )
+                    return
                 
                 # Handle empty chunks
                 if not chunk:
                     empty_count += 1
-                    if empty_count > 30:  # Increased from 20
-                        print(f"[Debug] Too many empty chunks, checking if complete")
-                        if accumulated and self.parser.is_thinking_complete(accumulated):
+                    if empty_count > 50:  # Reduced threshold
+                        print(f"[Debug] Too many empty chunks ({empty_count}), checking status")
+                        # If we're past thinking and the model is still alive, keep waiting
+                        if thinking_phase and len(accumulated) > 5000:
+                            print("[Warning] Very long thinking phase, may be stuck")
+                            stop_event.set()
+                            # Wait briefly for the generator to stop before fallback
+                            for _ in range(6):  # up to ~6s
+                                if not thread.is_alive():
+                                    break
+                                thread.join(timeout=1)
+                            yield "⚠️ Extended thinking detected; switching to answer mode."
+                            reasoning_text, _ = self.parser.extract_components(accumulated)
+                            yield from self._force_answer_after_think(
+                                message, history, reasoning_text, config
+                            )
+                            return
+                        # Only break if the generation thread has actually finished
+                        if not thread.is_alive() and accumulated and self.parser.is_thinking_complete(accumulated):
                             break
+                        # Otherwise, reset the counter and continue waiting
+                        empty_count = 0
                     continue
                 
                 accumulated += chunk
@@ -523,8 +774,9 @@ class ImprovedChatStreamer:
                 
                 # Format output based on state
                 if thinking_phase:
-                    # Show thinking progress with live metrics
-                    output = f"🧠 **Thinking...**\n\n```\n{reasoning[:500]}{'...' if len(reasoning) > 500 else ''}\n```\n\n⏳ Processing...{mini_telemetry}"
+                    # Show thinking progress with live metrics (truncate very long thinking)
+                    truncated_reasoning = reasoning[:1000] + '...' if len(reasoning) > 1000 else reasoning
+                    output = f"🧠 **Thinking...**\n\n```\n{truncated_reasoning}\n```\n\n⏳ Processing...{mini_telemetry}"
                 elif response and reasoning:
                     # Show BOTH reasoning and response with metrics
                     output = f"🧠 **Thinking Process:**\n\n```\n{reasoning}\n```\n\n💬 **Response:**\n\n{response}{mini_telemetry}"
@@ -543,12 +795,28 @@ class ImprovedChatStreamer:
                     last_output = output
                     yield output
             
-            # Wait for thread completion
-            thread.join(timeout=5)
+            # Wait for thread completion (graceful)
+            # Always signal stop once streaming ended
+            stop_event.set()
+            deadline = time.time() + 30  # wait up to 30s
+            while thread.is_alive() and time.time() < deadline:
+                thread.join(timeout=1)
+            
+            # Check if thread had an error
+            if thread.is_alive():
+                # Avoid alarming log spam; note but continue
+                print("[Debug] Generation thread still running after stream end; proceeding")
+                error_occurred = True
             
             # Final output with telemetry
-            if accumulated:
+            if accumulated and not error_occurred:
                 reasoning, response = self.parser.extract_components(accumulated)
+                
+                # Debug logging for empty response
+                if not response and reasoning:
+                    print(f"[Debug] No response after thinking. Accumulated text length: {len(accumulated)}")
+                    print(f"[Debug] Thinking complete: {self.parser.is_thinking_complete(accumulated)}")
+                    print(f"[Debug] Last 200 chars of accumulated: {repr(accumulated[-200:])}")
                 
                 # Calculate final telemetry
                 total_time = time.time() - start_time
@@ -568,6 +836,11 @@ class ImprovedChatStreamer:
                 
                 actual_total_tokens = actual_response_tokens + actual_thinking_tokens
                 
+                # Check if response is suspiciously short
+                response_warning = ""
+                if actual_response_tokens < 10 and actual_thinking_tokens > 0:
+                    response_warning = "\n⚠️ **Response is very short!** Try increasing 'Minimum Response Tokens' in settings."
+                
                 # Format telemetry
                 telemetry = f"""
 📊 **Generation Metrics:**
@@ -575,7 +848,7 @@ class ImprovedChatStreamer:
 - 🚀 Time to first token: {time_to_first_token:.3f}s
 - 📝 Total tokens: {actual_total_tokens} (thinking: {actual_thinking_tokens}, response: {actual_response_tokens})
 - ⚡ Speed: {tokens_per_second:.1f} tokens/sec (avg)
-- 🔄 Chunks processed: {chunk_count}
+- 🔄 Chunks processed: {chunk_count}{response_warning}
 """
                 
                 if response and reasoning:
@@ -595,7 +868,16 @@ class ImprovedChatStreamer:
                 
         except Exception as e:
             print(f"[Error] Streaming error: {e}")
-            yield f"❌ Error: {str(e)}"
+            import traceback
+            traceback.print_exc()
+            
+            # Try to provide helpful error message
+            if "probability tensor" in str(e):
+                yield "❌ Error: Numerical instability detected. Try adjusting temperature to 1.0 and using greedy decoding."
+            elif "out of memory" in str(e).lower():
+                yield "❌ Error: Out of memory. Try reducing max tokens or batch size."
+            else:
+                yield f"❌ Error during generation: {str(e)}\n\nTry adjusting generation parameters or restarting the interface."
 
 
 class ChatApplication:
@@ -622,11 +904,11 @@ class ChatApplication:
     
     def _print_system_info(self):
         """Print system and configuration information."""
-        print(f"\n📊 System Information:")
+        print("\n📊 System Information:")
         print(f"  Platform: {sys.platform}")
         print(f"  Python: {sys.version.split()[0]}")
         print(f"  PyTorch: {torch.__version__}")
-        print(f"\n⚙️  Configuration:")
+        print("\n⚙️  Configuration:")
         print(f"  Device: {self.config.device_type.value}")
         print(f"  Data Type: {self.config.dtype}")
         if self.config.quantization:
@@ -676,33 +958,76 @@ class ChatApplication:
                 temperature = gr.Slider(
                     minimum=0.1,
                     maximum=2.0,
-                    value=0.7,
+                    value=1.0,
                     step=0.1,
-                    label="Temperature"
+                    label="Temperature",
+                    info="1.0 is recommended for stability"
                 )
                 
                 max_tokens = gr.Slider(
                     minimum=50,
-                    maximum=2048,
-                    value=1024,
+                    maximum=10000,
+                    value=9000,  # Higher default to ensure room after thinking
                     step=50,
-                    label="Max Tokens"
+                    label="Max Tokens (Total for thinking + response)",
+                    info="Controls total generation length. Higher = longer responses"
                 )
                 
                 thinking_budget = gr.Slider(
                     minimum=0,
-                    maximum=2048,
+                    maximum=4096,
                     value=1024,  # Keep at 1024 per user requirement
                     step=256,
-                    label="Thinking Budget (Seed-OSS feature)"
+                    label="Thinking Budget (UI reference only)",
+                    info="Note: Actual thinking uses max_tokens to avoid early stopping. This value is for display only."
+                )
+                
+                min_response = gr.Slider(
+                    minimum=50,
+                    maximum=3000,
+                    value=800,  # Ensure stronger minimum for responses
+                    step=50,
+                    label="Minimum Response Tokens",
+                    info="Minimum tokens to generate for the response after thinking (increase for code generation)"
+                )
+                
+                timeout_mins = gr.Slider(
+                    minimum=1,
+                    maximum=60,
+                    value=30,
+                    step=5,
+                    label="Generation Timeout (minutes)",
+                    info="Maximum time for generation before timeout"
                 )
             
             # Event handlers
-            def handle_message(message, history, temp, max_tok, think_budget):
+            def handle_message(message, history, temp, max_tok, think_budget, min_resp, timeout_minutes):
                 """Handle message submission with improved input preservation."""
                 if not message.strip():
                     yield history, message
                     return
+                
+                # Detect code generation requests
+                code_keywords = ['code', 'html', 'webpage', 'website', 'javascript', 'python', 'css', 'program', 'script', 'function', 'implement']
+                is_code_request = any(keyword in message.lower() for keyword in code_keywords)
+                
+                if is_code_request:
+                    print("[Info] Code generation request detected - adjusting parameters")
+                    # For code generation, ensure higher minimums
+                    if min_resp < 800:
+                        min_resp = 800
+                        print(f"[Info] Increased min_response to {min_resp} for code generation")
+                    if max_tok < 6000:
+                        max_tok = 6000
+                        print(f"[Info] Increased max_tokens to {max_tok} for code generation")
+                
+                # Validate token settings
+                if think_budget + min_resp > max_tok:
+                    warning_msg = f"⚠️ Warning: Max tokens ({max_tok}) should be >= thinking budget ({think_budget}) + min response ({min_resp})"
+                    print(warning_msg)
+                    history = history + [[message, warning_msg]]
+                    yield history, message
+                    # Continue anyway but with warning
                 
                 # Store original message
                 original_msg = message
@@ -711,12 +1036,18 @@ class ChatApplication:
                 history = history + [[message, ""]]
                 yield history, original_msg  # Keep input visible
                 
+                # Set timeout for this generation
+                self.streamer.generation_timeout = timeout_minutes * 60  # Convert to seconds
+                
                 # Generate response
                 config = GenerationConfig(
                     temperature=temp,
                     max_tokens=max_tok,
-                    thinking_budget=think_budget
+                    thinking_budget=think_budget,
+                    min_response_tokens=min_resp
                 )
+                
+                print(f"[Info] Generating with max_tokens={max_tok}, thinking_budget={think_budget}, min_response={min_resp}")
                 
                 first_chunk = True
                 for response in self.streamer.generate_response(message, history[:-1], config):
@@ -732,14 +1063,14 @@ class ChatApplication:
             # Connect events
             msg.submit(
                 handle_message,
-                inputs=[msg, chatbot, temperature, max_tokens, thinking_budget],
+                inputs=[msg, chatbot, temperature, max_tokens, thinking_budget, min_response, timeout_mins],
                 outputs=[chatbot, msg],
                 queue=True
             )
             
             submit_btn.click(
                 handle_message,
-                inputs=[msg, chatbot, temperature, max_tokens, thinking_budget],
+                inputs=[msg, chatbot, temperature, max_tokens, thinking_budget, min_response, timeout_mins],
                 outputs=[chatbot, msg],
                 queue=True
             )
@@ -753,8 +1084,15 @@ class ChatApplication:
             gr.Markdown("""
             ---
             💡 **Tips:**
-            - The model uses a "thinking" phase before responding (controllable via Thinking Budget)
-            - Adjust Temperature for more/less creative responses
+            - The model uses a "thinking" phase before responding
+            - **Improved**: Thinking budget is applied safely and clamped to leave room for the answer
+            - **For Code Generation**: System auto-adjusts to min 800 response tokens & 8000+ max tokens
+            - The thinking phase typically uses ~1500 tokens, response uses remaining tokens
+            - Recommended settings:
+              - Text generation: Max Tokens = 4000-6000, Min Response = 500-800
+              - Code/HTML generation: Max Tokens = 8000-10000, Min Response = 800-2000
+            - Lower repetition penalty (1.02) for better code patterns
+            - Adjust Temperature (0.3-0.5 for precise code, 0.7-1.0 for creative text)
             - Clear the chat if responses seem stuck or repetitive
             """)
         
